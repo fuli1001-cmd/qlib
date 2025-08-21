@@ -9,7 +9,7 @@ import bisect
 from typing import Optional, Union, Text
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from src.dataset.gru_attention_dataset import GRUAttentionDatasetH
+from me.gru_attention.gru_attention_dataset import GRUAttentionDatasetH
 
 # Import Qlib related modules
 from qlib.log import get_module_logger
@@ -31,9 +31,10 @@ class MarketContextAttentionModel(nn.Module):
         self.key_layer = nn.Linear(input_size, context_size)
         self.value_layer = nn.Linear(input_size, context_size)
 
-    def forward(self, stock_features):
+    def forward(self, stock_features, stock_mask: Optional[torch.Tensor] = None):
         """
         Input shape: (batch_size, stocks, features)
+        stock_mask shape: (batch_size, stocks) with 1 for valid stocks, 0 for padded/absent
         Output shape: (batch_size, context_size) - market context vector
         """
         # 1. Generate Query, Key, Value
@@ -44,6 +45,11 @@ class MarketContextAttentionModel(nn.Module):
         # 2. Calculate attention scores (Scaled Dot-Product Attention)
         # scores shape: (batch_size, stocks, stocks)
         scores = torch.bmm(Q, K.transpose(1, 2)) / (K.size(-1)**0.5)
+        if stock_mask is not None:
+            # Mask keys (bool): set scores to very negative where key is invalid
+            # key_mask shape -> (batch, 1, stocks)
+            key_mask = stock_mask.unsqueeze(1)
+            scores = scores.masked_fill(~key_mask, -1e9)
         
         # 3. Normalize scores to get attention weights
         attention_weights = F.softmax(scores, dim=-1) # (batch_size, stocks, stocks)
@@ -53,8 +59,15 @@ class MarketContextAttentionModel(nn.Module):
         context_per_stock = torch.bmm(attention_weights, V)
 
         # 5. Aggregate context representations of all stocks to form a single market context vector
-        # Simply average across the stock dimension (can be replaced with other aggregation methods)
-        market_context_vector = context_per_stock.mean(dim=1) # (batch_size, context_size)
+        # Use masked mean across the query dimension so absent stocks do not contribute
+        if stock_mask is not None:
+            query_mask = stock_mask.unsqueeze(-1)  # (batch, stocks, 1) bool
+            masked_ctx = context_per_stock.masked_fill(~query_mask, 0.0)
+            masked_sum = masked_ctx.sum(dim=1)
+            denom = query_mask.sum(dim=1).clamp_min(1)  # count of valid stocks (int)
+            market_context_vector = masked_sum / denom.to(masked_sum.dtype).clamp_min(1e-6)
+        else:
+            market_context_vector = context_per_stock.mean(dim=1) # (batch_size, context_size)
 
         return market_context_vector
     
@@ -116,10 +129,11 @@ class GRUWithAttentionModel(nn.Module):
                     elif 'bias' in name: # Bias terms
                         nn.init.constant_(param, 0)
 
-    def forward(self, x):
+    def forward(self, x, feature_mask: Optional[torch.Tensor] = None):
         """
         Forward pass of the model.
         Input shape: (batch_size, days, stocks, features)
+        feature_mask shape: (batch_size, days, stocks), 1 for valid entries
         Output shape: (batch_size, stocks, output_size) - prediction for each stock
         """
         batch_size, days, stocks, features = x.shape
@@ -134,9 +148,12 @@ class GRUWithAttentionModel(nn.Module):
         for t in range(days):
             # 1. Extract features for all stocks at current time step: (batch_size, stocks, features)
             stock_data_at_t = x[:, t, :, :]
+            mask_t = None
+            if feature_mask is not None:
+                mask_t = feature_mask[:, t, :]
             
             # 2. Capture market context information: (batch_size, context_size)
-            market_context_t = self.market_context_attention(stock_data_at_t)
+            market_context_t = self.market_context_attention(stock_data_at_t, stock_mask=mask_t)
             
             # 3. Replicate market context for each stock and concatenate with original features
             # replicated_context_t shape: (batch_size, stocks, context_size)
@@ -163,18 +180,18 @@ class GRUWithAttentionModel(nn.Module):
         # 7. Input to GRU network
         # gru_output shape: (batch_size * stocks, days, gru_hidden_size)
         gru_output, _ = self.gru(gru_input)
-        
+
         # 8. Extract GRU's last time step output (for each stock)
         # last_step_output_flat shape: (batch_size * stocks, gru_hidden_size)
         last_step_output_flat = gru_output[:, -1, :]
-        
+
         # 9. Reshape back to (batch_size, stocks, gru_hidden_size) for per-stock prediction
         last_step_output_per_stock = last_step_output_flat.reshape(batch_size, stocks, self.gru_hidden_size)
-        
+
         # 10. Pass through output head to get classification results for each stock
         # logits shape: (batch_size, stocks, output_size)
         logits = self.output_head(last_step_output_per_stock)
-        
+
         return logits
 
 
@@ -183,9 +200,21 @@ class GRUAttention(Model):
     Qlib Custom GRU + Attention Model Class
     This class inherits from qlib.model.base.Model and implements training and prediction logic.
     """
-    def __init__(self, gru_num_layers: int = 1, lr: float = 0.001, epochs: int = 200, batch_size: int = 2048,
-                 dropout: float = 0.2, early_stop: int = 10, regression: bool = True, 
-                 seed: Optional[int] = None, step_len: int = 20, **kwargs):
+    def __init__(
+        self,
+        gru_num_layers: int = 1,
+        lr: float = 0.001,
+        epochs: int = 200,
+        batch_size: int = 2048,
+        dropout: float = 0.2,
+        early_stop: int = 10,
+        regression: bool = True,
+        seed: Optional[int] = None,
+        step_len: int = 20,
+        min_valid_days_in_window: Optional[int] = None,
+        min_tail_consecutive_days: Optional[int] = None,
+        **kwargs,
+    ):
         self.logger = get_module_logger("GRUAttention")
 
         if seed is not None:
@@ -202,13 +231,18 @@ class GRUAttention(Model):
         self.seed = seed
         self.step_len = step_len
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # Optional k/c constraints applied to label/pred gating
+        # k: minimum valid days in the lookback window to be eligible
+        # c: minimum consecutive valid days at the tail (including T) to be eligible
+        self.min_valid_days_in_window = min_valid_days_in_window
+        self.min_tail_consecutive_days = min_tail_consecutive_days
 
         if regression:
             self.output_size = 1
             self.criterion = nn.MSELoss()
         else:
             self.output_size = 2
-            self.criterion = nn.CrossEntropyLoss() 
+            self.criterion = nn.CrossEntropyLoss()
 
         self.logger.info(
             "GRUAttention parameters setting:"
@@ -222,7 +256,9 @@ class GRUAttention(Model):
             "\ndevice : {}"
             "\nregression : {}"
             "\nseed : {}"
-            "\nstep_len : {}".format(
+            "\nstep_len : {}"
+            "\nmin_valid_days_in_window (k) : {}"
+            "\nmin_tail_consecutive_days (c) : {}".format(
                 self.output_size,
                 gru_num_layers,
                 dropout,
@@ -233,7 +269,9 @@ class GRUAttention(Model):
                 self.device,
                 regression,
                 seed,
-                step_len
+                step_len,
+                self.min_valid_days_in_window,
+                self.min_tail_consecutive_days,
             )
         )
         self.fitted = False
@@ -242,15 +280,18 @@ class GRUAttention(Model):
     def use_gpu(self):
         return self.device != torch.device("cpu")
 
-    def _calculate_loss(self, outputs, targets):
+    def _calculate_loss(self, outputs, targets, label_mask: Optional[torch.Tensor] = None):
         """Calculate loss based on regression or classification mode"""
         if self.regression:
             # For regression: outputs (batch_size, stocks, 1), targets (batch_size, stocks)
             outputs_flat = outputs.view(-1)  # Flatten to 1D
             targets_flat = targets.view(-1)   # Flatten to 1D
 
-            # Filter out NaN targets
-            mask = ~torch.isnan(targets_flat) & ~torch.isnan(outputs_flat)
+            # Filter out invalid targets using provided label_mask (preferred) or NaN check
+            if label_mask is not None:
+                mask = label_mask.reshape(-1)
+            else:
+                mask = ~torch.isnan(targets_flat) & ~torch.isnan(outputs_flat)
             if mask.sum() == 0:
                 raise ValueError("All target or output values are NaN")
             
@@ -259,9 +300,12 @@ class GRUAttention(Model):
             # For classification: outputs (batch_size, stocks, num_classes), targets (batch_size, stocks)
             outputs_flat = outputs.view(-1, self.output_size)  # (batch_size * stocks, num_classes)
             targets_flat = targets.view(-1).long()  # (batch_size * stocks)
-            
-            # Filter out NaN targets
-            mask = ~torch.isnan(targets_flat) & ~torch.isnan(outputs_flat)
+            # Filter out invalid targets
+            if label_mask is not None:
+                mask = label_mask.reshape(-1)
+            else:
+                # Assume all given labels are valid in classification if no mask provided
+                mask = torch.ones_like(targets_flat, dtype=torch.bool)
             if mask.sum() == 0:
                 raise ValueError("All target or output values are NaN")
             
@@ -283,12 +327,12 @@ class GRUAttention(Model):
         input_size = train_ds[0][0].shape[-1]
         hidden_size = input_size * 4
         self.model = GRUWithAttentionModel(
-            input_size=input_size, 
-            output_size=self.output_size, 
-            context_size=hidden_size, 
-            gru_hidden_size=hidden_size, 
-            gru_num_layers=self.gru_num_layers, 
-            dropout=self.dropout
+            input_size=input_size,
+            output_size=self.output_size,
+            context_size=hidden_size,
+            gru_hidden_size=hidden_size,
+            gru_num_layers=self.gru_num_layers,
+            dropout=self.dropout,
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.lr)
 
@@ -297,7 +341,7 @@ class GRUAttention(Model):
         best_val_loss = float("inf")
         best_epoch = 0
         best_param = copy.deepcopy(self.model.state_dict())
-        
+
         if evals_result is None:
             evals_result = {"train": [], "valid": []}
         else:
@@ -309,22 +353,51 @@ class GRUAttention(Model):
             self.model.train()
             total_loss = 0
             num_batches = 0
-            
-            for X_batch, y_batch in train_loader:
+
+            for batch in train_loader:
+                # Unpack batch supporting masks: (X, y, feature_mask, label_mask) or (X, y)
+                if len(batch) == 4:
+                    X_batch, y_batch, feature_mask_batch, label_mask_batch = batch
+                    feature_mask_batch = feature_mask_batch.to(self.device)
+                    label_mask_batch = label_mask_batch.to(self.device)
+                else:
+                    X_batch, y_batch = batch
+                    feature_mask_batch = None
+                    label_mask_batch = None
                 X_batch = X_batch.to(self.device)
                 y_batch = y_batch.to(self.device)
 
                 self.optimizer.zero_grad()
-                outputs = self.model(X_batch) # outputs shape: (batch_size, num_stocks, output_size)
-                
+                outputs = self.model(X_batch, feature_mask=feature_mask_batch)  # (batch, stocks, output)
+
+                # Apply optional k/c constraints to label mask (in addition to dataset-provided mask)
+                combined_label_mask = label_mask_batch
+                if feature_mask_batch is not None:
+                    # last day presence mask (batch, stocks)
+                    last_day_mask = feature_mask_batch[:, -1, :]
+                    if combined_label_mask is None:
+                        combined_label_mask = last_day_mask.clone()
+                    # k: minimum valid days in window
+                    if self.min_valid_days_in_window is not None:
+                        valid_days = feature_mask_batch.sum(dim=1)  # (batch, stocks), int
+                        cond_k = valid_days >= int(self.min_valid_days_in_window)
+                        combined_label_mask = combined_label_mask & cond_k
+                    # c: minimum tail consecutive valid days
+                    if self.min_tail_consecutive_days is not None and int(self.min_tail_consecutive_days) > 1:
+                        fm_rev = feature_mask_batch.flip(dims=[1]).to(dtype=torch.float32)
+                        tail_run = torch.cumprod(fm_rev, dim=1).sum(dim=1)  # (batch, stocks), float
+                        cond_c = tail_run >= float(int(self.min_tail_consecutive_days))
+                        combined_label_mask = combined_label_mask & cond_c
                 # Calculate loss
-                loss = self._calculate_loss(outputs, y_batch)
-                self.logger.info(f"train epoch: {epoch + 1}, outputs: {outputs.shape}, y_batch: {y_batch.shape}, loss: {loss.item()}")
-                
+                loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
+                self.logger.info(
+                    f"train epoch: {epoch + 1}, outputs: {outputs.shape}, y_batch: {y_batch.shape}, loss: {loss.item()}"
+                )
+
                 loss.backward()
                 torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
                 self.optimizer.step()
-                
+
                 total_loss += loss.item()
                 num_batches += 1
 
@@ -335,20 +408,45 @@ class GRUAttention(Model):
             self.model.eval()
             valid_loss = 0
             valid_batches = 0
-            
+
             with torch.no_grad():
-                for X_batch, y_batch in valid_loader:
+                for batch in valid_loader:
+                    if len(batch) == 4:
+                        X_batch, y_batch, feature_mask_batch, label_mask_batch = batch
+                        feature_mask_batch = feature_mask_batch.to(self.device)
+                        label_mask_batch = label_mask_batch.to(self.device)
+                    else:
+                        X_batch, y_batch = batch
+                        feature_mask_batch = None
+                        label_mask_batch = None
                     X_batch = X_batch.to(self.device)
                     y_batch = y_batch.to(self.device)
 
-                    outputs = self.model(X_batch)
-                    loss = self._calculate_loss(outputs, y_batch)
-                    self.logger.info(f"valid epoch: {epoch + 1}, outputs: {outputs.shape}, y_batch: {y_batch.shape}, loss: {loss.item()}")
-                    
+                    outputs = self.model(X_batch, feature_mask=feature_mask_batch)
+                    # Apply optional k/c constraints during validation
+                    combined_label_mask = label_mask_batch
+                    if feature_mask_batch is not None:
+                        last_day_mask = feature_mask_batch[:, -1, :]
+                        if combined_label_mask is None:
+                            combined_label_mask = last_day_mask.clone()
+                        if self.min_valid_days_in_window is not None:
+                            valid_days = feature_mask_batch.sum(dim=1)
+                            cond_k = valid_days >= int(self.min_valid_days_in_window)
+                            combined_label_mask = combined_label_mask & cond_k
+                        if self.min_tail_consecutive_days is not None and int(self.min_tail_consecutive_days) > 1:
+                            fm_rev = feature_mask_batch.flip(dims=[1]).to(dtype=torch.float32)
+                            tail_run = torch.cumprod(fm_rev, dim=1).sum(dim=1)
+                            cond_c = tail_run >= float(int(self.min_tail_consecutive_days))
+                            combined_label_mask = combined_label_mask & cond_c
+                    loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
+                    self.logger.info(
+                        f"valid epoch: {epoch + 1}, outputs: {outputs.shape}, y_batch: {y_batch.shape}, loss: {loss.item()}"
+                    )
+
                     valid_loss += loss.item()
                     valid_batches += 1
-                    
-            avg_valid_loss = valid_loss / valid_batches if valid_batches > 0 else float('inf')
+
+            avg_valid_loss = valid_loss / valid_batches if valid_batches > 0 else float("inf")
             evals_result["valid"].append(-avg_valid_loss)
 
             if avg_valid_loss < best_val_loss:
@@ -362,11 +460,13 @@ class GRUAttention(Model):
                     self.logger.info("early stop")
                     break
 
-            self.logger.info(f"Epoch {epoch+1}/{self.epochs}, Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}")
+            self.logger.info(
+                f"Epoch {epoch+1}/{self.epochs}, Train Loss: {avg_train_loss:.4f}, Valid Loss: {avg_valid_loss:.4f}"
+            )
 
         self.logger.info("best val loss: %.6lf @ %d" % (best_val_loss, best_epoch))
         self.model.load_state_dict(best_param)
-        
+
         if save_path:
             torch.save(best_param, save_path)
 
@@ -385,22 +485,49 @@ class GRUAttention(Model):
         # Prepare test data
         test_ds = dataset.prepare(segment, col_set=["feature"], data_key=DataHandlerLP.DK_I)
         test_loader = DataLoader(test_ds, batch_size=self.batch_size, shuffle=False)
-        
+
         if len(test_ds) == 0:
             raise ValueError(f"Test data for segment {segment} is empty. Please check your dataset preparation.")
-        
+
         preds = []
         self.model.eval()
-        
+
         with torch.no_grad():
-            for (X_batch,) in test_loader:
+            for batch in test_loader:
+                if len(batch) == 2:
+                    X_batch, feature_mask_batch = batch
+                    feature_mask_batch = feature_mask_batch.to(self.device)
+                else:
+                    X_batch = batch[0]
+                    feature_mask_batch = None
                 X_batch = X_batch.to(self.device)
-                pred = self.model(X_batch).detach().cpu().numpy()  # (batch_size, stocks, output_size)
+                pred = (
+                    self.model(X_batch, feature_mask=feature_mask_batch).detach().cpu().numpy()
+                )  # (batch_size, stocks, output_size)
+                # Gate predictions by presence on T and optional k/c constraints; set others to NaN
+                if feature_mask_batch is not None:
+                    # Base: last day presence
+                    last_day_mask = feature_mask_batch[:, -1, :]  # (batch, stocks) bool
+                    valid_mask = last_day_mask.clone()
+                    # k: minimum valid days in window
+                    if self.min_valid_days_in_window is not None:
+                        valid_days = feature_mask_batch.sum(dim=1)  # (batch, stocks)
+                        cond_k = valid_days >= int(self.min_valid_days_in_window)
+                        valid_mask = valid_mask & cond_k
+                    # c: minimum consecutive days at tail (including T)
+                    if self.min_tail_consecutive_days is not None and int(self.min_tail_consecutive_days) > 1:
+                        fm_rev = feature_mask_batch.flip(dims=[1]).to(dtype=torch.float32)
+                        tail_run = torch.cumprod(fm_rev, dim=1).sum(dim=1)  # (batch, stocks)
+                        cond_c = tail_run >= float(int(self.min_tail_consecutive_days))
+                        valid_mask = valid_mask & cond_c
+                    valid_mask_np = valid_mask.detach().cpu().numpy()
+                    # Set all channels/classes to NaN for invalid
+                    pred[~valid_mask_np] = np.nan
                 preds.append(pred)
 
         # Concatenate all predictions
         all_preds = np.concatenate(preds, axis=0)  # (num_samples, stocks, output_size)
-        
+
         # Flatten predictions for Series output
         if self.output_size == 1:
             all_preds_flat = all_preds.reshape(-1)
@@ -408,6 +535,6 @@ class GRUAttention(Model):
         else:
             # For multi-output, return DataFrame
             all_preds_flat = all_preds.reshape(-1, self.output_size)
-            columns = [f'score_class_{i}' for i in range(self.output_size)]
+            columns = [f"score_class_{i}" for i in range(self.output_size)]
             return pd.DataFrame(all_preds_flat, index=dataset.infer_index, columns=columns)
 

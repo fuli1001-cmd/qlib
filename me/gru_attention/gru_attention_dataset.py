@@ -43,6 +43,8 @@ class GRUAttentionDataSampler(Dataset):
             (len(unique_dates), len(unique_stocks), df['feature'].shape[1]), 
             dtype=np.float32
         )
+        # 记录该 (date, stock) 是否在原始数据中出现（用于动态股票池/未上市）
+        presence = np.zeros((len(unique_dates), len(unique_stocks)), dtype=bool)
         
         if has_label:
             label_type = np.float32 if regression else np.int64
@@ -54,20 +56,36 @@ class GRUAttentionDataSampler(Dataset):
             for _, row in stock_df.iterrows():
                 date_idx = date_to_idx[row.name]
                 all_features[date_idx, stock_id_idx, :] = row['feature'].values
+                presence[date_idx, stock_id_idx] = True
                 if has_label:
                     all_labels[date_idx, stock_id_idx] = row['label'].values[0]
 
-        # 统计all_features中nan的占比
+        # 基于原始数值构造 feature_mask：要求该位置存在且所有特征为有限值（保持为 bool 以节省内存）
+        finite_feat = np.isfinite(all_features).all(axis=-1)
+        feature_mask_full = (presence & finite_feat)  # (days, stocks) -> bool
+        # label 的有效性：存在且为有限值（分类任务的整型也视为有效），保持为 bool
+        if has_label:
+            label_finite = np.isfinite(all_labels)
+            label_mask_full = (presence & label_finite)  # bool
+        else:
+            label_mask_full = None
+
+        # 统计原始 all_features 中 NaN/Inf 的占比（用于诊断）
         nan_ratio = np.isnan(all_features).mean()
-        self.logger.info(f"NaN ratio in all_features: {nan_ratio:.4f}")
+        inf_ratio = np.isinf(all_features).mean()
+        pres_ratio = presence.mean()
+        self.logger.info(
+            f"features: NaN {nan_ratio:.4f}, Inf {inf_ratio:.4f}, presence {pres_ratio:.4f}, feature_mask mean {feature_mask_full.mean():.4f}"
+        )
 
         # 遍历所有时间步，创建时间窗口样本
         for i in tqdm(range(len(unique_dates) - self.step_len + 1), desc="生成样本"):
             # 获取当前窗口的特征和标签
             window_features = all_features[i:i + self.step_len, :, :]
-            # 防御性处理：将残留的 NaN/Inf 转为 0，避免后续 tensor 含 NaN
-            window_features = np.nan_to_num(window_features, nan=0.0, posinf=0.0, neginf=0.0)
+            window_feature_mask = feature_mask_full[i:i + self.step_len, :]
             features_tensor = torch.tensor(window_features, dtype=torch.float32)
+            # 保持 mask 为 bool，避免额外内存占用
+            feature_mask_tensor = torch.from_numpy(window_feature_mask.astype(np.bool_))
 
             # if torch.isnan(features_tensor).any():
             #     self.logger.warning(f"!!! NaN detected in features_tensor at window {i}")
@@ -77,9 +95,14 @@ class GRUAttentionDataSampler(Dataset):
                 label_type = torch.float32 if regression else torch.long
                 window_label = all_labels[i + self.step_len - 1, :]
                 label_tensor = torch.tensor(window_label, dtype=label_type)
-                self.samples.append((features_tensor, label_tensor))
+                # 仅最后一天用于监督的 label_mask
+                window_label_mask = label_mask_full[i + self.step_len - 1, :]
+                label_mask_tensor = torch.from_numpy(window_label_mask.astype(np.bool_))
+                # 返回：(features, label, feature_mask, label_mask)
+                self.samples.append((features_tensor, label_tensor, feature_mask_tensor, label_mask_tensor))
             else:
-                self.samples.append((features_tensor,))
+                # 返回：(features, feature_mask)
+                self.samples.append((features_tensor, feature_mask_tensor))
             
         self.logger.info(f"数据处理完成，共生成 {len(self.samples)} 个时间步的样本。device: {self.samples[0][0].device if self.samples else 'N/A'}")
 

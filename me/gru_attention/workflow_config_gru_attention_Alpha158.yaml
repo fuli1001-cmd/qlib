@@ -65,6 +65,12 @@ task:
             regression: true
             step_len: 20
             seed: 42
+            # k/c gating for eligibility
+            # min_valid_days_in_window (k): require at least k valid days in the step_len window to output/score
+            # min_tail_consecutive_days (c): require at least c consecutive valid days ending at T
+            # Set to null to disable the constraint respectively
+            min_valid_days_in_window: 12   # example: for step_len=20, 12/20=60%
+            min_tail_consecutive_days: 2   # example: at least 2 consecutive days incl. T
     dataset:
         class: GRUAttentionDatasetH
         module_path: me.gru_attention.gru_attention_dataset
