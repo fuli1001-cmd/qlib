@@ -72,7 +72,7 @@ class MarketContextAttentionModel(nn.Module):
         return market_context_vector
     
 class GRUWithAttentionModel(nn.Module):
-    def __init__(self, input_size: int, output_size: int, context_size: int = 64, gru_hidden_size: int = 64, gru_num_layers: int = 1, dropout: float = 0.2):
+    def __init__(self, input_size: int, output_size: int, context_size: int = 20, gru_hidden_size: int = 64, gru_num_layers: int = 1, dropout: float = 0.2):
         super().__init__()
         
         self.input_size = input_size
@@ -202,6 +202,8 @@ class GRUAttention(Model):
     """
     def __init__(
         self,
+        context_size: int = 20,
+        gru_hidden_size: int = 64,
         gru_num_layers: int = 1,
         lr: float = 0.001,
         epochs: int = 200,
@@ -221,6 +223,8 @@ class GRUAttention(Model):
             torch.manual_seed(seed)
             np.random.seed(seed)
 
+        self.context_size = context_size
+        self.gru_hidden_size = gru_hidden_size
         self.gru_num_layers = gru_num_layers
         self.lr = lr
         self.epochs = epochs
@@ -247,6 +251,8 @@ class GRUAttention(Model):
         self.logger.info(
             "GRUAttention parameters setting:"
             "\noutput_size : {}"
+            "\ncontext_size : {}"
+            "\ngru_hidden_size : {}"
             "\ngru_num_layers : {}"
             "\ndropout : {}"
             "\nepochs : {}"
@@ -260,6 +266,8 @@ class GRUAttention(Model):
             "\nmin_valid_days_in_window (k) : {}"
             "\nmin_tail_consecutive_days (c) : {}".format(
                 self.output_size,
+                context_size,
+                gru_hidden_size,
                 gru_num_layers,
                 dropout,
                 epochs,
@@ -346,12 +354,11 @@ class GRUAttention(Model):
             raise ValueError("Training data is empty. Please check your dataset preparation.")
 
         input_size = train_ds[0][0].shape[-1]
-        hidden_size = input_size * 4
         self.model = GRUWithAttentionModel(
             input_size=input_size,
             output_size=self.output_size,
-            context_size=hidden_size,
-            gru_hidden_size=hidden_size,
+            context_size=self.context_size,
+            gru_hidden_size=self.gru_hidden_size,
             gru_num_layers=self.gru_num_layers,
             dropout=self.dropout,
         ).to(self.device)
