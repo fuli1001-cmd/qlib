@@ -87,10 +87,6 @@ class GRUAttentionDataSampler(Dataset):
             # 保持 mask 为 bool，避免额外内存占用
             feature_mask_tensor = torch.from_numpy(window_feature_mask.astype(np.bool_))
 
-            # if torch.isnan(features_tensor).any():
-            #     self.logger.warning(f"!!! NaN detected in features_tensor at window {i}")
-            #     continue
-
             if has_label:
                 label_type = torch.float32 if regression else torch.long
                 window_label = all_labels[i + self.step_len - 1, :]
@@ -165,19 +161,19 @@ class GRUAttentionDatasetH(DatasetH):
         df = super()._prepare_seg(slc, **kwargs)
         # self.logger.info(f"--------- Data prepared for segment {slc} with shape: {df.shape}, head: {df.head()}, tail: {df.tail()}, kwargs: {kwargs}")
 
-        # df_feature = df["feature"]
-        # nan_ratio = df_feature.isna().mean().mean()
+        df_feature = df["feature"]
+        nan_ratio = df_feature.isna().mean().mean()
         
-        # # 计算总元素数量
-        # total_elements = df_feature.size
-        # # 检测无穷大值
-        # inf_mask = np.isinf(df_feature)
-        # # 计算无穷大值的数量
-        # inf_elements = inf_mask.sum().sum()
-        # # 计算无穷大值所占比例
-        # inf_ratio = inf_elements / total_elements
-        # nan_cols = df_feature.columns[(df_feature.isna().any())]
-        # self.logger.info(f"NaN ratio in df_feature {nan_ratio:.4f}, inf ratio: {inf_ratio:.4f}, cols has nan: {nan_cols}")
+        # 计算总元素数量
+        total_elements = df_feature.size
+        # 检测无穷大值
+        inf_mask = np.isinf(df_feature)
+        # 计算无穷大值的数量
+        inf_elements = inf_mask.sum().sum()
+        # 计算无穷大值所占比例
+        inf_ratio = inf_elements / total_elements
+        nan_cols = df_feature.columns[(df_feature.isna().any())]
+        self.logger.info(f"NaN ratio in df_feature {nan_ratio:.4f}, inf ratio: {inf_ratio:.4f}, cols has nan: {nan_cols}")
 
         # # 按 datetime 分组并计算每组的大小
         # group_sizes = df.groupby(level='datetime').size()

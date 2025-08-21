@@ -311,6 +311,27 @@ class GRUAttention(Model):
             
             return self.criterion(outputs_flat[mask], targets_flat[mask])
         
+    def _get_combined_label_mask(self, feature_mask_batch, label_mask_batch):
+        ''' Apply optional k/c constraints to label mask (in addition to dataset-provided mask) '''
+        combined_label_mask = label_mask_batch
+        if feature_mask_batch is not None:
+            # last day presence mask (batch, stocks)
+            last_day_mask = feature_mask_batch[:, -1, :]
+            if combined_label_mask is None:
+                combined_label_mask = last_day_mask.clone()
+            # k: minimum valid days in window
+            if self.min_valid_days_in_window is not None:
+                valid_days = feature_mask_batch.sum(dim=1)  # (batch, stocks), int
+                cond_k = valid_days >= int(self.min_valid_days_in_window)
+                combined_label_mask = combined_label_mask & cond_k
+            # c: minimum tail consecutive valid days
+            if self.min_tail_consecutive_days is not None and int(self.min_tail_consecutive_days) > 1:
+                fm_rev = feature_mask_batch.flip(dims=[1]).to(dtype=torch.float32)
+                tail_run = torch.cumprod(fm_rev, dim=1).sum(dim=1)  # (batch, stocks), float
+                cond_c = tail_run >= float(int(self.min_tail_consecutive_days))
+                combined_label_mask = combined_label_mask & cond_c
+        return combined_label_mask
+        
     def fit(self, dataset: DatasetH, evals_result=None, save_path=None):
         if not isinstance(dataset, GRUAttentionDatasetH):
             raise ValueError("Dataset must be an instance of GRUAttentionDatasetH for GRU with Attention model.")
@@ -371,23 +392,7 @@ class GRUAttention(Model):
                 outputs = self.model(X_batch, feature_mask=feature_mask_batch)  # (batch, stocks, output)
 
                 # Apply optional k/c constraints to label mask (in addition to dataset-provided mask)
-                combined_label_mask = label_mask_batch
-                if feature_mask_batch is not None:
-                    # last day presence mask (batch, stocks)
-                    last_day_mask = feature_mask_batch[:, -1, :]
-                    if combined_label_mask is None:
-                        combined_label_mask = last_day_mask.clone()
-                    # k: minimum valid days in window
-                    if self.min_valid_days_in_window is not None:
-                        valid_days = feature_mask_batch.sum(dim=1)  # (batch, stocks), int
-                        cond_k = valid_days >= int(self.min_valid_days_in_window)
-                        combined_label_mask = combined_label_mask & cond_k
-                    # c: minimum tail consecutive valid days
-                    if self.min_tail_consecutive_days is not None and int(self.min_tail_consecutive_days) > 1:
-                        fm_rev = feature_mask_batch.flip(dims=[1]).to(dtype=torch.float32)
-                        tail_run = torch.cumprod(fm_rev, dim=1).sum(dim=1)  # (batch, stocks), float
-                        cond_c = tail_run >= float(int(self.min_tail_consecutive_days))
-                        combined_label_mask = combined_label_mask & cond_c
+                combined_label_mask = self._get_combined_label_mask(feature_mask_batch, label_mask_batch)
                 # Calculate loss
                 loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
                 self.logger.info(
@@ -424,20 +429,7 @@ class GRUAttention(Model):
 
                     outputs = self.model(X_batch, feature_mask=feature_mask_batch)
                     # Apply optional k/c constraints during validation
-                    combined_label_mask = label_mask_batch
-                    if feature_mask_batch is not None:
-                        last_day_mask = feature_mask_batch[:, -1, :]
-                        if combined_label_mask is None:
-                            combined_label_mask = last_day_mask.clone()
-                        if self.min_valid_days_in_window is not None:
-                            valid_days = feature_mask_batch.sum(dim=1)
-                            cond_k = valid_days >= int(self.min_valid_days_in_window)
-                            combined_label_mask = combined_label_mask & cond_k
-                        if self.min_tail_consecutive_days is not None and int(self.min_tail_consecutive_days) > 1:
-                            fm_rev = feature_mask_batch.flip(dims=[1]).to(dtype=torch.float32)
-                            tail_run = torch.cumprod(fm_rev, dim=1).sum(dim=1)
-                            cond_c = tail_run >= float(int(self.min_tail_consecutive_days))
-                            combined_label_mask = combined_label_mask & cond_c
+                    combined_label_mask = self._get_combined_label_mask(feature_mask_batch, label_mask_batch)
                     loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
                     self.logger.info(
                         f"valid epoch: {epoch + 1}, outputs: {outputs.shape}, y_batch: {y_batch.shape}, loss: {loss.item()}"
@@ -506,21 +498,8 @@ class GRUAttention(Model):
                 )  # (batch_size, stocks, output_size)
                 # Gate predictions by presence on T and optional k/c constraints; set others to NaN
                 if feature_mask_batch is not None:
-                    # Base: last day presence
-                    last_day_mask = feature_mask_batch[:, -1, :]  # (batch, stocks) bool
-                    valid_mask = last_day_mask.clone()
-                    # k: minimum valid days in window
-                    if self.min_valid_days_in_window is not None:
-                        valid_days = feature_mask_batch.sum(dim=1)  # (batch, stocks)
-                        cond_k = valid_days >= int(self.min_valid_days_in_window)
-                        valid_mask = valid_mask & cond_k
-                    # c: minimum consecutive days at tail (including T)
-                    if self.min_tail_consecutive_days is not None and int(self.min_tail_consecutive_days) > 1:
-                        fm_rev = feature_mask_batch.flip(dims=[1]).to(dtype=torch.float32)
-                        tail_run = torch.cumprod(fm_rev, dim=1).sum(dim=1)  # (batch, stocks)
-                        cond_c = tail_run >= float(int(self.min_tail_consecutive_days))
-                        valid_mask = valid_mask & cond_c
-                    valid_mask_np = valid_mask.detach().cpu().numpy()
+                    combined_label_mask = self._get_combined_label_mask(feature_mask_batch, None)
+                    valid_mask_np = combined_label_mask.detach().cpu().numpy()
                     # Set all channels/classes to NaN for invalid
                     pred[~valid_mask_np] = np.nan
                 preds.append(pred)
