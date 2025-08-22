@@ -9,7 +9,7 @@ import bisect
 from typing import Optional, Union, Text
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from me.gru_attention.gru_attention_dataset import GRUAttentionDatasetH
+from gru_attention.gru_attention_dataset import GRUAttentionDatasetH
 
 # Import Qlib related modules
 from qlib.log import get_module_logger
