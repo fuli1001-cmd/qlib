@@ -130,6 +130,39 @@ class GRUWithAttentionModel(nn.Module):
                     elif 'bias' in name: # Bias terms
                         nn.init.constant_(param, 0)
 
+    def log_gradients(self):
+        """
+        日志记录：仅在梯度异常（消失/爆炸）时输出每层的 L2 norm / min / max。
+        """
+        abnormal = []
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                grad = param.grad.detach()
+                norm = grad.norm(2)  # L2 norm
+
+                # # ---- 新增的特定层日志（用于诊断）----
+                # norm_val = norm.item()
+                # min_val = grad.min().item()
+                # max_val = grad.max().item()
+                # if name == "cross_feature_attn.key.weight" or name == "cross_feature_attn.query.weight":
+                #     self.logger.info(f"[INFO_GRAD] {name} | L2 norm={norm_val:.2e} | min={min_val:.2e} | max={max_val:.2e}")
+                # # ---- 结束新增 ----
+
+                # 判断阈值
+                if norm < 1e-6 and "bias" not in name:
+                    norm_val = norm.item()
+                    min_val = grad.min().item()
+                    max_val = grad.max().item()
+                    # self.logger.info(f"[vanish] {name} | L2 norm={norm_val:.2e} | min={min_val:.2e} | max={max_val:.2e}")
+                    abnormal.append(("vanish", name, norm_val, min_val, max_val))
+                elif norm > 1e2:
+                    norm_val = norm.item()
+                    min_val = grad.min().item()
+                    max_val = grad.max().item()
+                    # self.logger.info(f"[explode] {name} | L2 norm={norm_val:.2e} | min={min_val:.2e} | max={max_val:.2e}")
+                    abnormal.append(("explode", name, norm_val, min_val, max_val))
+        return abnormal
+
     def forward(self, x, feature_mask: Optional[torch.Tensor] = None):
         """
         Forward pass of the model.
@@ -416,6 +449,16 @@ class GRUAttention(Model):
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
+
+                # 监控梯度
+                abnormal = self.model.log_gradients()
+                if abnormal:  # 返回列表形式 [("vanish", name, norm, min, max), ...]
+                    vanish_counter += sum(1 for item in abnormal if item[0] == "vanish")
+                    explode_counter += sum(1 for item in abnormal if item[0] == "explode")
+                if vanish_counter > 5:
+                    self.logger.warning(f"🚨 梯度消失{vanish_counter} 次")
+                if explode_counter > 5:
+                    self.logger.warning(f"🚨 梯度爆炸{explode_counter}次")
 
                 total_loss += loss.item()
                 num_batches += 1
