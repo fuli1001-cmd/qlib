@@ -455,10 +455,10 @@ class GRUAttention(Model):
                 if abnormal:  # 返回列表形式 [("vanish", name, norm, min, max), ...]
                     vanish_counter = sum(1 for item in abnormal if item[0] == "vanish")
                     explode_counter = sum(1 for item in abnormal if item[0] == "explode")
-                if vanish_counter > 5:
-                    self.logger.warning(f"🚨 梯度消失{vanish_counter} 次")
-                if explode_counter > 5:
-                    self.logger.warning(f"🚨 梯度爆炸{explode_counter}次")
+                    if vanish_counter > 5:
+                        self.logger.warning(f"🚨 梯度消失{vanish_counter} 次")
+                    if explode_counter > 5:
+                        self.logger.warning(f"🚨 梯度爆炸{explode_counter}次")
 
                 total_loss += loss.item()
                 num_batches += 1
