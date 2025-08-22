@@ -73,6 +73,7 @@ task:
             # Set to null to disable the constraint respectively
             min_valid_days_in_window: 12   # example: for step_len=20, 12/20=60%
             min_tail_consecutive_days: 2   # example: at least 2 consecutive days incl. T
+            use_amp: True
     dataset:
         class: GRUAttentionDatasetH
         module_path: gru_attention.gru_attention_dataset

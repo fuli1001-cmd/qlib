@@ -8,6 +8,7 @@ import copy
 import bisect
 from typing import Optional, Union, Text
 from torch.utils.data import DataLoader
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from gru_attention.gru_attention_dataset import GRUAttentionDatasetH
 
@@ -215,6 +216,7 @@ class GRUAttention(Model):
         step_len: int = 20,
         min_valid_days_in_window: Optional[int] = None,
         min_tail_consecutive_days: Optional[int] = None,
+        use_amp: bool = True,
         **kwargs,
     ):
         self.logger = get_module_logger("GRUAttention")
@@ -240,6 +242,9 @@ class GRUAttention(Model):
         # c: minimum consecutive valid days at the tail (including T) to be eligible
         self.min_valid_days_in_window = min_valid_days_in_window
         self.min_tail_consecutive_days = min_tail_consecutive_days
+        self.use_amp = use_amp
+        self.scaler = GradScaler(device='cuda', enabled=self.use_amp)
+        self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else None
 
         if regression:
             self.output_size = 1
@@ -263,6 +268,8 @@ class GRUAttention(Model):
             "\nregression : {}"
             "\nseed : {}"
             "\nstep_len : {}"
+            "\nuse_amp : {}"
+            "\ndtype : {}"
             "\nmin_valid_days_in_window (k) : {}"
             "\nmin_tail_consecutive_days (c) : {}".format(
                 self.output_size,
@@ -278,6 +285,8 @@ class GRUAttention(Model):
                 regression,
                 seed,
                 step_len,
+                self.use_amp,
+                self.dtype,
                 self.min_valid_days_in_window,
                 self.min_tail_consecutive_days,
             )
@@ -395,19 +404,18 @@ class GRUAttention(Model):
                 y_batch = y_batch.to(self.device)
 
                 self.optimizer.zero_grad()
-                outputs = self.model(X_batch, feature_mask=feature_mask_batch)  # (batch, stocks, output)
-
-                # Apply optional k/c constraints to label mask (in addition to dataset-provided mask)
-                combined_label_mask = self._get_combined_label_mask(feature_mask_batch, label_mask_batch)
-                # Calculate loss
-                loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
-                self.logger.info(
-                    f"train epoch: {epoch + 1}, outputs: {outputs.shape}, y_batch: {y_batch.shape}, loss: {loss.item()}"
-                )
-
-                loss.backward()
-                torch.nn.utils.clip_grad_value_(self.model.parameters(), 3.0)
-                self.optimizer.step()
+                with autocast(device_type='cuda', dtype=self.dtype, enabled=self.use_amp):
+                    outputs = self.model(X_batch, feature_mask=feature_mask_batch)  # (batch, stocks, output)
+                    # Apply optional k/c constraints to label mask (in addition to dataset-provided mask)
+                    combined_label_mask = self._get_combined_label_mask(feature_mask_batch, label_mask_batch)
+                    # Calculate loss
+                    loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
+                self.scaler.scale(loss).backward()
+                # 梯度裁剪
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=3.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
                 total_loss += loss.item()
                 num_batches += 1
@@ -433,13 +441,11 @@ class GRUAttention(Model):
                     X_batch = X_batch.to(self.device)
                     y_batch = y_batch.to(self.device)
 
-                    outputs = self.model(X_batch, feature_mask=feature_mask_batch)
-                    # Apply optional k/c constraints during validation
-                    combined_label_mask = self._get_combined_label_mask(feature_mask_batch, label_mask_batch)
-                    loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
-                    self.logger.info(
-                        f"valid epoch: {epoch + 1}, outputs: {outputs.shape}, y_batch: {y_batch.shape}, loss: {loss.item()}"
-                    )
+                    with autocast(device_type='cuda', dtype=self.dtype, enabled=self.use_amp):
+                        outputs = self.model(X_batch, feature_mask=feature_mask_batch)
+                        # Apply optional k/c constraints during validation
+                        combined_label_mask = self._get_combined_label_mask(feature_mask_batch, label_mask_batch)
+                        loss = self._calculate_loss(outputs, y_batch, label_mask=combined_label_mask)
 
                     valid_loss += loss.item()
                     valid_batches += 1
