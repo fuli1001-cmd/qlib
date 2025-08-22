@@ -324,9 +324,8 @@ class GRUAttention(Model):
         combined_label_mask = label_mask_batch
         if feature_mask_batch is not None:
             # last day presence mask (batch, stocks)
-            last_day_mask = feature_mask_batch[:, -1, :]
             if combined_label_mask is None:
-                combined_label_mask = last_day_mask.clone()
+                combined_label_mask = feature_mask_batch[:, -1, :].clone()
             # k: minimum valid days in window
             if self.min_valid_days_in_window is not None:
                 valid_days = feature_mask_batch.sum(dim=1)  # (batch, stocks), int
@@ -489,6 +488,8 @@ class GRUAttention(Model):
             raise ValueError(f"Test data for segment {segment} is empty. Please check your dataset preparation.")
 
         preds = []
+        present_masks = []  # last-day presence masks to align length with infer_index
+        combined_masks = []  # optional k/c gating masks to NaN-out values after alignment
         self.model.eval()
 
         with torch.no_grad():
@@ -503,24 +504,44 @@ class GRUAttention(Model):
                 pred = (
                     self.model(X_batch, feature_mask=feature_mask_batch).detach().cpu().numpy()
                 )  # (batch_size, stocks, output_size)
-                # Gate predictions by presence on T and optional k/c constraints; set others to NaN
+                # Collect masks
                 if feature_mask_batch is not None:
+                    # Presence on the last day (T) — used to align with infer_index
+                    last_day_presence = feature_mask_batch[:, -1, :]
+                    present_masks.append(last_day_presence.detach().cpu().numpy())
+                    # Optional k/c gating (subset of presence) — used to set NaN on values but not to slice index
                     combined_label_mask = self._get_combined_label_mask(feature_mask_batch, None)
-                    valid_mask_np = combined_label_mask.detach().cpu().numpy()
-                    # Set all channels/classes to NaN for invalid
-                    pred[~valid_mask_np] = np.nan
+                    combined_masks.append(combined_label_mask.detach().cpu().numpy())
                 preds.append(pred)
 
-        # Concatenate all predictions
+        # Concatenate all predictions and masks
         all_preds = np.concatenate(preds, axis=0)  # (num_samples, stocks, output_size)
 
-        # Flatten predictions for Series output
-        if self.output_size == 1:
-            all_preds_flat = all_preds.reshape(-1)
-            return pd.Series(all_preds_flat, index=dataset.infer_index)
+        # Determine presence mask for alignment (defaults to all True if no mask provided)
+        if present_masks:
+            presence = np.concatenate(present_masks, axis=0)  # (num_samples, stocks)
         else:
-            # For multi-output, return DataFrame
-            all_preds_flat = all_preds.reshape(-1, self.output_size)
+            presence = np.ones(all_preds.shape[:2], dtype=bool)
+
+        presence_flat = presence.reshape(-1)
+        infer_index = dataset.infer_index  # Do NOT slice infer_index with k/c; it's already built from presence
+
+        # Flatten predictions by presence to match infer_index length
+        if self.output_size == 1:
+            values = all_preds.reshape(-1)[presence_flat]
+            # Apply optional k/c gating as NaN without changing index length
+            if combined_masks:
+                combined = np.concatenate(combined_masks, axis=0).reshape(-1)
+                combined_on_present = combined[presence_flat]
+                values[~combined_on_present] = np.nan
+            return pd.Series(values, index=infer_index)
+        else:
+            values = all_preds.reshape(-1, self.output_size)[presence_flat]
+            # Apply optional k/c gating as NaN without changing index length
+            if combined_masks:
+                combined = np.concatenate(combined_masks, axis=0).reshape(-1)
+                combined_on_present = combined[presence_flat]
+                values[~combined_on_present, :] = np.nan
             columns = [f"score_class_{i}" for i in range(self.output_size)]
-            return pd.DataFrame(all_preds_flat, index=dataset.infer_index, columns=columns)
+            return pd.DataFrame(values, index=infer_index, columns=columns)
 

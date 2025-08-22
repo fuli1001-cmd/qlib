@@ -27,8 +27,8 @@ class GRUAttentionDataSampler(Dataset):
         self.samples = []
         has_label = True if 'label' in df.columns else False
 
-        # 确保数据已按时间排序
-        df = df.sort_index()
+        # # 确保数据已按时间排序
+        # df = df.sort_index()
         
         # 获取唯一的日期和股票ID
         unique_dates = df.index.get_level_values("datetime").unique()
@@ -60,13 +60,16 @@ class GRUAttentionDataSampler(Dataset):
                 if has_label:
                     all_labels[date_idx, stock_id_idx] = row['label'].values[0]
 
-        # 基于原始数值构造 feature_mask：要求该位置存在且所有特征为有限值（保持为 bool 以节省内存）
-        finite_feat = np.isfinite(all_features).all(axis=-1)
-        feature_mask_full = (presence & finite_feat)  # (days, stocks) -> bool
+        # # 基于原始数值构造 feature_mask：要求该位置存在且所有特征为有限值（保持为 bool 以节省内存）
+        # finite_feat = np.isfinite(all_features).all(axis=-1)
+        # feature_mask_full = (presence & finite_feat)  # (days, stocks) -> bool
+        feature_mask_full = presence
+
         # label 的有效性：存在且为有限值（分类任务的整型也视为有效），保持为 bool
         if has_label:
-            label_finite = np.isfinite(all_labels)
-            label_mask_full = (presence & label_finite)  # bool
+            # label_finite = np.isfinite(all_labels)
+            # label_mask_full = (presence & label_finite)  # bool
+            label_mask_full = presence
         else:
             label_mask_full = None
 
@@ -80,18 +83,19 @@ class GRUAttentionDataSampler(Dataset):
 
         # 遍历所有时间步，创建时间窗口样本
         for i in tqdm(range(len(unique_dates) - self.step_len + 1), desc="生成样本"):
-            # 获取当前窗口的特征和标签
+            # 窗口特征
             window_features = all_features[i:i + self.step_len, :, :]
-            window_feature_mask = feature_mask_full[i:i + self.step_len, :]
             features_tensor = torch.tensor(window_features, dtype=torch.float32)
-            # 保持 mask 为 bool，避免额外内存占用
+            # 窗口特征掩码
+            window_feature_mask = feature_mask_full[i:i + self.step_len, :]
             feature_mask_tensor = torch.from_numpy(window_feature_mask.astype(np.bool_))
 
             if has_label:
                 label_type = torch.float32 if regression else torch.long
+                # 窗口标签
                 window_label = all_labels[i + self.step_len - 1, :]
                 label_tensor = torch.tensor(window_label, dtype=label_type)
-                # 仅最后一天用于监督的 label_mask
+                # 窗口标签掩码
                 window_label_mask = label_mask_full[i + self.step_len - 1, :]
                 label_mask_tensor = torch.from_numpy(window_label_mask.astype(np.bool_))
                 # 返回：(features, label, feature_mask, label_mask)
@@ -159,6 +163,7 @@ class GRUAttentionDatasetH(DatasetH):
         
         # data = self.handler.fetch(col_set=["feature", "label"], data_key=kwargs["data_key"])
         df = super()._prepare_seg(slc, **kwargs)
+        df = df.sort_index()
         # self.logger.info(f"--------- Data prepared for segment {slc} with shape: {df.shape}, head: {df.head()}, tail: {df.tail()}, kwargs: {kwargs}")
 
         df_feature = df["feature"]
@@ -188,7 +193,7 @@ class GRUAttentionDatasetH(DatasetH):
             unique_datetimes = df.index.get_level_values('datetime').unique()
             start_datetime = unique_datetimes[self.step_len - 1]
             self.infer_index = df.index[df.index.get_level_values('datetime') >= start_datetime]
-            self.logger.info(f"--------- infer_index head: {self.infer_index}")
+            self.logger.info(f"infer_index head: {self.infer_index}")
 
         return GRUAttentionDataSampler(df=df, step_len=self.step_len, regression=self.regression)
 
