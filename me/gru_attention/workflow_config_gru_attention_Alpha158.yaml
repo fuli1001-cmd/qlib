@@ -4,10 +4,10 @@ qlib_init:
 market: &market csi300
 benchmark: &benchmark SH000300
 data_handler_config: &data_handler_config
-    start_time: 2008-01-01
-    end_time: 2020-08-01
-    fit_start_time: 2008-01-01
-    fit_end_time: 2014-12-31
+    start_time: 2012-06-01
+    end_time: 2025-08-01
+    fit_start_time: 2013-01-01
+    fit_end_time: 2021-12-31
     instruments: *market
     infer_processors:
         - class: FilterCol
@@ -40,8 +40,8 @@ port_analysis_config: &port_analysis_config
             topk: 50
             n_drop: 5
     backtest:
-        start_time: 2017-01-01
-        end_time: 2020-08-01
+        start_time: 2022-01-01
+        end_time: 2025-08-01
         account: 100000000
         benchmark: *benchmark
         exchange_kwargs:
@@ -83,9 +83,9 @@ task:
                 module_path: qlib.contrib.data.handler
                 kwargs: *data_handler_config
             segments:
-                train: [2008-01-01, 2014-12-31]
-                valid: [2015-01-01, 2016-12-31]
-                test: [2017-01-01, 2020-08-01]
+                train: [2013-01-01, 2019-12-31]
+                valid: [2020-01-01, 2021-12-31]
+                test: [2022-01-01, 2025-08-01]
             step_len: 20
             regression: true
     record: 
