@@ -453,8 +453,8 @@ class GRUAttention(Model):
                 # 监控梯度
                 abnormal = self.model.log_gradients()
                 if abnormal:  # 返回列表形式 [("vanish", name, norm, min, max), ...]
-                    vanish_counter += sum(1 for item in abnormal if item[0] == "vanish")
-                    explode_counter += sum(1 for item in abnormal if item[0] == "explode")
+                    vanish_counter = sum(1 for item in abnormal if item[0] == "vanish")
+                    explode_counter = sum(1 for item in abnormal if item[0] == "explode")
                 if vanish_counter > 5:
                     self.logger.warning(f"🚨 梯度消失{vanish_counter} 次")
                 if explode_counter > 5:
